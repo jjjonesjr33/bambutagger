@@ -13,7 +13,7 @@ Designed around the MIFARE Classic 1K tags embedded in Bambu Lab spools, with fu
 | **RFID** | Read, clone, and write Bambu Lab MIFARE Classic 1K spool tags |
 | **Gen1A / Gen2 / Gen3 / Gen4 magic card support** | Gen1A: 0x40/0x43 backdoor, all 64 blocks verbatim; Gen4 (GTU/GDM): CF-command backdoor, all 64 blocks verbatim; Gen3 (APDU): block 0 via `90 F0 CC CC` APDU; Gen2 (CUID/FUID): implicit detection via block 0 write |
 | **Key derivation** | HKDF-SHA256 with Bambu Lab salt — no hardcoded keys |
-| **OLED menu** | 7-item navigable menu on a 128×64 SH110X / SH1106G display |
+| **OLED menu** | 8-item navigable menu on a 128×64 SH110X / SH1106G display |
 | **Rotary encoder** | ENC11/KY-040 encoder for scroll + click navigation |
 | **WS2812B LED** | Single addressable LED showing filament colour and status |
 | **Web UI** | Five-tab interface: Files / Dumps / Status / WiFi / BambuMan |
@@ -87,7 +87,7 @@ Schematics are here [schematics](/schematics/schematics.png)
 | Setting | Value |
 |---------|-------|
 | Board | **ESP32 Dev Module** |
-| Partition Scheme | **Custom** (select `partitions.csv` — see below) |
+| Partition Scheme | **Custom** (select `partitions_4mb_custom.csv` — see below) |
 | Flash Size | 4 MB |
 | Upload Speed | 921600 |
 | Monitor Speed | **115200** |
@@ -101,11 +101,11 @@ Copy it into the Arduino ESP32 core's partitions directory:
 
 ```
 # macOS / Linux
-cp partitions.csv \
-   ~/Library/Arduino15/packages/esp32/hardware/esp32/<version>/tools/partitions/partitions_4mb_custom.csv
+cp partitions_4mb_custom.csv \
+   ~/Library/Arduino15/packages/esp32/hardware/esp32/<version>/tools/partitions/
 # Windows
-copy partitions.csv ^
-   %LOCALAPPDATA%\Arduino15\packages\esp32\hardware\esp32\<version>\tools\partitions\partitions_4mb_custom.csv
+copy partitions_4mb_custom.csv ^
+   %LOCALAPPDATA%\Arduino15\packages\esp32\hardware\esp32\<version>\tools\partitions\
 ```
 
 Then select **Tools → Partition Scheme → partitions_4mb_custom**.
@@ -135,8 +135,9 @@ Press and hold, or select **\<\< MENU** (always the first row in any browser) to
 │   3 Write Dump  │
 │   4 GitHub Lib  │
 │   5 BambuMan    │
-│   6 WiFi / Web  │
-│   7 OTA Update  │
+│   6 Gen4 Tool   │
+│   7 WiFi / Web  │
+│   8 OTA Update  │
 └─────────────────┘
 ```
 
@@ -365,7 +366,66 @@ To eliminate per-keypress SD reads at the top three levels, BambuTagger pre-load
 | `UID not found` | HTTP 404 from bambuman.ee |
 | `Blocked (CF) — try Web UI` | HTTP 403 (Cloudflare) — use the web UI BambuMan tab instead |
 
-### 7 · OTA Update
+---
+
+### 6 · Gen4 Tool
+
+A dedicated flow for managing the GTU backdoor on **Gen4 (GTU / GDM / USCUID)** magic cards — **without** needing to write a dump first.
+
+#### How to use
+
+1. Select **8 Gen4 Tool** from the main menu.
+2. When prompted, place the card on the reader (20 s window, teal LED pulse).
+3. The sketch probes the card via `CF 00000000 CC`:
+   - **Not a Gen4 card** → shows a message and returns to the menu.
+   - **Gen4 confirmed** → reads the current GTU mode byte and displays it in the header.
+4. An action menu appears:
+
+```
+┌──────────────────────┐
+│  Gen4  magic on(0x03)│
+│> Skip                │
+│  Seal                │
+│  Unlock              │
+└──────────────────────┘
+```
+
+| Option | GTU cfg[0] value | Effect |
+|--------|-----------------|--------|
+| **Skip** (default) | unchanged | No config change; return to menu |
+| **Seal** | `0x00` | Magic backdoor permanently **off**; card is indistinguishable from a genuine MIFARE Classic |
+| **Unlock** | `0x03` | Magic backdoor **on**; all CF backdoor commands accepted again |
+
+> ⚠️ **Sealing is irreversible via software.** A sealed card (`0x00`) disables its own backdoor, so `gen4Unlock()` will fail on a sealed card. Physical re-flashing of the chip is the only recovery path.
+
+#### Post-write seal/unlock prompt
+
+The same 3-option mini-menu also appears automatically after a **successful Gen4 write** (all 16 sectors OK) in the Write Dump flow, giving you the option to seal or unlock the card immediately after programming.
+
+| Encoder action | Result |
+|----------------|--------|
+| Click on chosen option | Execute Seal / Unlock / Skip |
+| 20 s timeout | Auto-Skip |
+
+#### LED colours during Gen4 Tool
+
+| State | LED |
+|-------|-----|
+| Waiting for card | 🩵 Teal pulse |
+| Seal success | 🟢 2 × green flash |
+| Seal failure | 🔴 2 × red flash |
+| Unlock success | 🟢 2 × green flash |
+| Unlock failure | 🔴 2 × red flash |
+| Not a Gen4 card | 🟠 2 × amber flash |
+
+---
+
+### 7 · WiFi / Web
+Shows the current IP address (STA or AP).  Open a browser to the displayed address to access the web UI.
+
+---
+
+### 8 · OTA Update
 Checks the [BambuTagger GitHub releases](https://github.com/VID-PRO/BambuTagger/releases/latest) for a newer firmware version and flashes it over-the-air.  Requires WiFi (STA) connectivity.
 
 #### OLED update flow
@@ -379,7 +439,7 @@ Step 1 — Checking…          Step 2a — Up to date          Step 2b — Upda
 │   [cyan LED]         │    │   [green flash]      │      │   New: v1.0.1        │
 │                      │    │                      │      │   [click]=FLASH      │
 └──────────────────────┘    └──────────────────────┘      │   [enc]=cancel  15 s │
-                                                          └──────────────────────┘
+                                                           └──────────────────────┘
 
 Step 3 — Flashing                      Step 4 — Done
 ┌──────────────────────┐               ┌──────────────────────┐
@@ -401,13 +461,10 @@ The firmware flashed is `BambuTagger.ino.bin` from the latest GitHub release (ap
 | Result | LED | Message |
 |--------|-----|---------|
 | Already up to date | 🟢 green flash | `Up to date! vX.Y.Z` |
-| Flashing in progress | 🔵 Pulsing cyan → 🟡 solid yellow | `Flashing... N%` |
+| Flashing in progress | 🟡 Pulsing cyan → solid yellow | `Flashing... N%` |
 | Flash success | 🟢 green flash | `Done! Rebooting` |
 | Network error / GitHub error | 🔴 red flash | Error detail on OLED |
 | User cancelled | — | Returns to main menu |
-
-### 6 · WiFi / Web
-Shows the current IP address (STA or AP).  Open a browser to the displayed address to access the web UI.
 
 ---
 
@@ -544,6 +601,10 @@ All endpoints return JSON unless noted.
 | OTA — downloading / flashing | 🔵 Pulsing cyan → 🟡 solid yellow during flash |
 | OTA — flash success | 🟢 3 × green flash |
 | OTA — flash failure | 🔴 3 × red flash |
+| Gen4 Tool — waiting for card | 🩵 Teal pulse |
+| Gen4 Tool — Seal / Unlock success | 🟢 2 × green flash |
+| Gen4 Tool — Seal / Unlock failure | 🔴 2 × red flash |
+| Gen4 Tool — not a Gen4 card | 🟠 2 × amber flash |
 
 ---
 

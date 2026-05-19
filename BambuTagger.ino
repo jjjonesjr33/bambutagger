@@ -119,7 +119,7 @@
 #define AP_SSID "BambuTagger"
 #define AP_PASS "bambu1234"
 
-#define FIRMWARE_VERSION "1.7.4"          // bumped by release workflow tag
+#define FIRMWARE_VERSION "1.7.6"          // bumped by release workflow tag
 #define OTA_REPO         "VID-PRO/BambuTagger"
 
 #define GITHUB_API_HOST "api.github.com"
@@ -263,7 +263,8 @@ enum AppState {
   S_BM_BROWSE,     // BambuMan OLED browser (waiting for tag)
   S_BM_DOWNLOAD,   // BambuMan fetch in progress
   S_BM_CAT_BROWSE, // BambuMan catalog 4-level OLED browser
-  S_OTA_UPDATE     // OTA firmware update flow
+  S_OTA_UPDATE,    // OTA firmware update flow
+  S_GEN4_MANAGE    // Gen4 card management (Seal / Unlock)
 };
 AppState appState = S_MAIN_MENU;
 
@@ -276,10 +277,11 @@ static const char* MENU_ITEMS[] = {
   "3 Write Tag",
   "4 GitHub Lib",
   "5 BambuMan Lib",
-  "6 WiFi / Web",
-  "7 OTA Update"
+  "6 Gen4 Tool",
+  "7 WiFi / Web",
+  "8 OTA Update"
 };
-static const int MENU_COUNT = 7;
+static const int MENU_COUNT = 8;
 int menuSel = 0;
 int menuScroll = 0;
 String bmFetchUid = "";  // UID fetched from BambuMan
@@ -711,6 +713,123 @@ static bool gen4WriteBlock(uint8_t blockAddr, const uint8_t* data16) {
   return s == MFRC522::STATUS_OK && (resp[0] & 0x0F) == 0x0A;
 }
 
+/* Read the 20-byte GTU config block from a Gen4 card (CF <pw> C6).
+   Returns true and fills cfg[20] on success. */
+static bool gen4ReadConfig(uint8_t cfg[20]) {
+  uint8_t cmd[6];
+  cmd[0] = 0xCF;  memcpy(cmd + 1, GEN4_PW, 4);  cmd[5] = 0xC6;
+  uint8_t resp[24]; uint8_t respLen = sizeof(resp);
+  if (!rfidRawCmd(cmd, 6, resp, &respLen)) return false;
+  if (respLen < 20) return false;
+  memcpy(cfg, resp, 20);
+  return true;
+}
+
+/* Write the 20-byte GTU config block to a Gen4 card (CF <pw> F0 <cfg>).
+   Returns true on success. */
+static bool gen4WriteConfig(const uint8_t cfg[20]) {
+  uint8_t cmd[26];
+  cmd[0] = 0xCF;  memcpy(cmd + 1, GEN4_PW, 4);  cmd[5] = 0xF0;
+  memcpy(cmd + 6, cfg, 20);
+  uint8_t resp[8]; uint8_t respLen = sizeof(resp);
+  // Try CRC-checked response first
+  if (rfidRawCmd(cmd, 26, resp, &respLen)) return true;
+  // Retry without response CRC (card may ACK with raw 4-bit nibble)
+  uint8_t pkt[28];
+  memcpy(pkt, cmd, 26);
+  byte crc[2];
+  if (rfid.PCD_CalculateCRC(pkt, 26, crc) != MFRC522::STATUS_OK) return false;
+  pkt[26] = crc[0]; pkt[27] = crc[1];
+  uint8_t respLen2 = sizeof(resp); uint8_t vBits = 0;
+  MFRC522::StatusCode s = rfid.PCD_TransceiveData(
+      pkt, 28, resp, &respLen2, &vBits, 0, false);
+  return s == MFRC522::STATUS_OK;
+}
+
+/* Seal a Gen4 card by setting GTU mode byte (cfg[0]) to 0x00.
+   Mode 0x00 = magic-mode permanently disabled; card behaves as standard MIFARE.
+   Reads current config, patches byte 0, writes back.
+   Returns true on success. */
+static bool gen4Seal() {
+  uint8_t cfg[20] = {};
+  if (!gen4ReadConfig(cfg)) {
+    DBGLN("[WRITE] Gen4 seal: config read failed");
+    return false;
+  }
+  DBGF("[WRITE] Gen4 cfg[0] before seal: 0x%02X\n", cfg[0]);
+  if (cfg[0] == 0x00) {
+    DBGLN("[WRITE] Gen4 already sealed (mode=0x00)");
+    return true;  // already sealed
+  }
+  cfg[0] = 0x00;  // disable magic mode permanently
+  bool ok = gen4WriteConfig(cfg);
+  DBGF("[WRITE] Gen4 seal write: %s\n", ok ? "OK" : "FAIL");
+  return ok;
+}
+
+/* Unlock a previously sealed Gen4 card by restoring cfg[0] = 0x03 (magic always on).
+   Returns true on success. */
+static bool gen4Unlock() {
+  uint8_t cfg[20] = {};
+  if (!gen4ReadConfig(cfg)) {
+    DBGLN("[WRITE] Gen4 unlock: config read failed (card may be sealed)");
+    return false;
+  }
+  DBGF("[WRITE] Gen4 cfg[0] before unlock: 0x%02X\n", cfg[0]);
+  if (cfg[0] == 0x03) {
+    DBGLN("[WRITE] Gen4 already unlocked (mode=0x03)");
+    return true;  // already in magic-always-on mode
+  }
+  cfg[0] = 0x03;  // magic mode always enabled
+  bool ok = gen4WriteConfig(cfg);
+  DBGF("[WRITE] Gen4 unlock write: %s\n", ok ? "OK" : "FAIL");
+  return ok;
+}
+
+/* Read the Gen4 GTU mode byte (cfg[0]).
+   Returns the mode byte, or 0xFF on failure.
+   Mode values:
+     0x00 = magic permanently disabled (sealed)
+     0x01 = magic disabled until power cycle
+     0x02 = shadow mode
+     0x03 = magic always on (factory default) */
+static uint8_t gen4GetMode() {
+  uint8_t cfg[20] = {};
+  if (!gen4ReadConfig(cfg)) return 0xFF;
+  return cfg[0];
+}
+
+/* Render a Gen4 Seal/Unlock/Skip action menu on the OLED.
+   sel: 0=Skip, 1=Seal (0x00), 2=Unlock (0x03) */
+static void drawGen4ActionMenu(int sel, const char* header) {
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setTextColor(SH110X_WHITE);
+  oled.setCursor(0, 0);  oled.println(header);
+  oled.drawFastHLine(0, 9, 128, SH110X_WHITE);
+  const char* opts[3] = { "Skip", "Seal (perm. disable)", "Unlock (magic on)" };
+  for (int i = 0; i < 3; i++) {
+    oled.setCursor(0, 12 + i * 10);
+    oled.print(i == sel ? ">" : " ");
+    oled.print(" ");
+    oled.println(opts[i]);
+  }
+  oled.display();
+}
+
+// Flash a colour n times with 120 ms on / 120 ms off, then restore to `restoreR/G/B`
+static void ledFlash(uint8_t r, uint8_t g, uint8_t b,
+                     int n,
+                     uint8_t restoreR = 0, uint8_t restoreG = 0, uint8_t restoreB = 0) {
+  for (int i = 0; i < n; i++) {
+    ledSet(r, g, b);
+    delay(120);
+    ledOff();
+    delay(120);
+  }
+  ledSet(restoreR, restoreG, restoreB);
+}
+
 /* Write a 1024-byte dump to a card.
    Card-type detection order:
      1. Gen1A  – responds to 0x40/0x43 backdoor; all 64 blocks written verbatim
@@ -805,6 +924,48 @@ int rfidWriteDump(const uint8_t* buf, bool /*isMagicCard — now auto-detected v
         }
         DBGF("[WRITE] sector %02d -> %s\n", sec, sectorOk ? "OK" : "FAIL");
         if (sectorOk) sectorsOk++;
+      }
+
+      // ── Gen4 seal/unlock prompt (only if all sectors written successfully) ─
+      if (sectorsOk == NUM_SECTORS) {
+        // 3-option mini-menu: 0=Skip, 1=Seal, 2=Unlock
+        int g4sel = 0;
+        drawGen4ActionMenu(g4sel, "Gen4 written OK!");
+        unsigned long t0 = millis();
+        bool confirmed = false;
+        while (millis() - t0 < 20000) {
+          httpServer.handleClient();
+          encUpdate();
+          int d = encGetDelta();
+          if (d > 0) { g4sel = (g4sel + 1) % 3; drawGen4ActionMenu(g4sel, "Gen4 written OK!"); t0 = millis(); }
+          if (d < 0) { g4sel = (g4sel - 1 + 3) % 3; drawGen4ActionMenu(g4sel, "Gen4 written OK!"); t0 = millis(); }
+          if (encGetClick()) { confirmed = true; break; }
+          delay(10);
+        }
+        if (confirmed && g4sel != 0) {
+          if (g4sel == 1) {
+            showStatus("Gen4\n\nSealing...");
+            bool ok = gen4Seal();
+            DBGF("[WRITE] Gen4 seal: %s\n", ok ? "OK" : "FAIL");
+            if (ok) { showStatus("Gen4 Sealed!\n\nMagic mode OFF\nStandard MIFARE\n\nClick to return."); ledFlash(0, 255, 0, 2); }
+            else    { showStatus("Gen4 Seal FAIL\n\nClick to return."); ledFlash(255, 0, 0, 2); }
+          } else {  // g4sel == 2
+            showStatus("Gen4\n\nUnlocking...");
+            bool ok = gen4Unlock();
+            DBGF("[WRITE] Gen4 unlock: %s\n", ok ? "OK" : "FAIL");
+            if (ok) { showStatus("Gen4 Unlocked!\n\nMagic mode ON\n\nClick to return."); ledFlash(0, 255, 0, 2); }
+            else    { showStatus("Gen4 Unlock FAIL\n\nClick to return."); ledFlash(255, 0, 0, 2); }
+          }
+          t0 = millis();
+          while (millis() - t0 < 8000) {
+            httpServer.handleClient();
+            encUpdate();
+            if (encGetClick() || encGetDelta() != 0) break;
+            delay(10);
+          }
+        } else {
+          DBGLN("[WRITE] Gen4 action skipped");
+        }
       }
 
     } else {
@@ -991,19 +1152,6 @@ static void ledOff() {
 // Show the filament colour from a parsed TagInfo
 static void ledSetTagColor(const TagInfo* t) {
   ledSet(t->colorR, t->colorG, t->colorB);
-}
-
-// Flash a colour n times with 120 ms on / 120 ms off, then restore to `restoreR/G/B`
-static void ledFlash(uint8_t r, uint8_t g, uint8_t b,
-                     int n,
-                     uint8_t restoreR = 0, uint8_t restoreG = 0, uint8_t restoreB = 0) {
-  for (int i = 0; i < n; i++) {
-    ledSet(r, g, b);
-    delay(120);
-    ledOff();
-    delay(120);
-  }
-  ledSet(restoreR, restoreG, restoreB);
 }
 
 // Slow dim-blue pulse used while waiting for a card (call in a loop, non-blocking)
@@ -3136,7 +3284,7 @@ void processOtaUpdate() {
   if (!rel.ok) {
     // rel.tag carries a hint when available (e.g. "1.6.0 (no asset)")
     String hint = rel.tag.length() ? rel.tag : "See serial log";
-    showStatus(("OTA Update\n\nCheck failed!\n" + hint + "\n\nClick to return.").c_str());
+    showStatus(("OTA Update\nCheck failed!\n" + hint + "\n\nClick to return.").c_str());
     ledFlash(255, 0, 0, 2);
     appState = S_WIFI_INFO;
     return;
@@ -4817,8 +4965,9 @@ void handleMenuEncoder() {
         enterGhBrowse("", true);
         break;
       case 4: enterBmBrowse(); break;
-      case 5: enterWifiInfo(); break;
-      case 6: appState = S_OTA_UPDATE; break;
+      case 5: appState = S_GEN4_MANAGE; break;
+      case 6: enterWifiInfo(); break;
+      case 7: appState = S_OTA_UPDATE; break;
     }
   }
 }
@@ -5056,6 +5205,114 @@ void processCloneTarget() {
   appState = S_WIFI_INFO;
 }
 
+// ──────────────────────────────────────────────────────────────
+//  Gen4 Tool  — standalone Seal / Unlock flow
+// ──────────────────────────────────────────────────────────────
+void processGen4Manage() {
+  DBGLN("[GEN4] processGen4Manage: waiting for card…");
+  showStatus("Gen4 Tool\nPlace card on\nreader…\n\nPress to cancel");
+  ledSet(0, 40, 80);  // teal
+
+  unsigned long deadline = millis() + 20000;
+  while (millis() < deadline) {
+    httpServer.handleClient();
+    encUpdate();
+    ledScanPulse();
+    if (encGetClick()) { enterMainMenu(); return; }
+
+    // Wait for any card
+    if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) {
+      delay(20);
+      continue;
+    }
+
+    // ── Card detected — probe Gen4 ──────────────────────────
+    DBGLN("[GEN4] Card present — probing Gen4…");
+    bool isG4 = gen4Detect();
+
+    if (!isG4) {
+      DBGLN("[GEN4] Not a Gen4 card");
+      rfid.PICC_HaltA();
+      rfid.PCD_StopCrypto1();
+      ledFlash(255, 128, 0, 2);
+      showStatus("Gen4 Tool\nNot a Gen4 card\n\nClick to return.");
+      unsigned long t2 = millis();
+      while (millis() - t2 < 5000) {
+        httpServer.handleClient();
+        encUpdate();
+        if (encGetClick() || encGetDelta() != 0) break;
+        delay(10);
+      }
+      enterMainMenu();
+      return;
+    }
+
+    // ── Gen4 confirmed — read current mode ─────────────────
+    uint8_t mode = gen4GetMode();
+    DBGF("[GEN4] Current mode byte: 0x%02X\n", mode);
+    char hdr[32];
+    if (mode == 0xFF)         snprintf(hdr, sizeof(hdr), "Gen4  mode: ???");
+    else if (mode == 0x00)    snprintf(hdr, sizeof(hdr), "Gen4  SEALED (0x00)");
+    else if (mode == 0x01)    snprintf(hdr, sizeof(hdr), "Gen4  mode 0x01");
+    else if (mode == 0x02)    snprintf(hdr, sizeof(hdr), "Gen4  shadow (0x02)");
+    else if (mode == 0x03)    snprintf(hdr, sizeof(hdr), "Gen4  magic on (0x03)");
+    else                      snprintf(hdr, sizeof(hdr), "Gen4  mode 0x%02X", mode);
+
+    int g4sel = 0;
+    drawGen4ActionMenu(g4sel, hdr);
+
+    unsigned long t0 = millis();
+    bool confirmed = false;
+    while (millis() - t0 < 20000) {
+      httpServer.handleClient();
+      encUpdate();
+      int d = encGetDelta();
+      if (d > 0) { g4sel = (g4sel + 1) % 3; drawGen4ActionMenu(g4sel, hdr); t0 = millis(); }
+      if (d < 0) { g4sel = (g4sel - 1 + 3) % 3; drawGen4ActionMenu(g4sel, hdr); t0 = millis(); }
+      if (encGetClick()) { confirmed = true; break; }
+      delay(10);
+    }
+
+    if (confirmed && g4sel != 0) {
+      if (g4sel == 1) {
+        showStatus("Gen4 Tool\n\nSealing...");
+        bool ok = gen4Seal();
+        DBGF("[GEN4] Seal: %s\n", ok ? "OK" : "FAIL");
+        if (ok) { showStatus("Gen4 Sealed!\nMagic mode OFF\nStandard MIFARE\n\nClick to return."); ledFlash(0, 255, 0, 2); }
+        else    { showStatus("Gen4 Seal FAIL\n\nClick to return."); ledFlash(255, 0, 0, 2); }
+      } else {  // g4sel == 2
+        showStatus("Gen4 Tool\n\nUnlocking...");
+        bool ok = gen4Unlock();
+        DBGF("[GEN4] Unlock: %s\n", ok ? "OK" : "FAIL");
+        if (ok) { showStatus("Gen4 Unlocked!\nMagic mode ON\n\nClick to return."); ledFlash(0, 255, 0, 2); }
+        else    { showStatus("Gen4 Unlock FAIL\n\nNOTE: Sealed cards\ncannot be unlocked\nvia software.\n\nClick to return."); ledFlash(255, 0, 0, 2); }
+      }
+    } else {
+      DBGLN("[GEN4] Action skipped / timeout");
+      showStatus("Gen4 Tool\nNo action taken\n\nClick to return.");
+    }
+
+    rfid.PICC_HaltA();
+    rfid.PCD_StopCrypto1();
+
+    unsigned long tw = millis();
+    while (millis() - tw < 8000) {
+      httpServer.handleClient();
+      encUpdate();
+      if (encGetClick() || encGetDelta() != 0) break;
+      delay(10);
+    }
+    enterMainMenu();
+    return;
+  }
+
+  // Timeout
+  DBGLN("[GEN4] Timeout — no card detected");
+  ledFlash(255, 0, 0, 2);
+  showStatus("Gen4 Tool\nNo card detected\n\nClick to return.");
+  appState = S_WIFI_INFO;  // "any key returns" state
+}
+
 void processDumpWrite() {
   DBGF("[DUMP]  processDumpWrite: file=%s  waiting for card (20 s)...\n",
        selectedDumpPath);
@@ -5247,6 +5504,10 @@ void loop() {
 
     case S_OTA_UPDATE:
       processOtaUpdate();
+      break;
+
+    case S_GEN4_MANAGE:
+      processGen4Manage();
       break;
 
     default:
