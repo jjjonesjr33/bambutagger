@@ -374,7 +374,7 @@ A dedicated flow for managing the GTU backdoor on **Gen4 (GTU / GDM / USCUID)** 
 
 #### How to use
 
-1. Select **8 Gen4 Tool** from the main menu.
+1. Select **6 Gen4 Tool** from the main menu.
 2. When prompted, place the card on the reader (20 s window, teal LED pulse).
 3. The sketch probes the card via `CF 00000000 CC`:
    - **Not a Gen4 card** → shows a message and returns to the menu.
