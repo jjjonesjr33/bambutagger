@@ -135,7 +135,7 @@ Press and hold, or select **\<\< MENU** (always the first row in any browser) to
 │   3 Write Dump  │
 │   4 GitHub Lib  │
 │   5 BambuMan    │
-│   6 Gen4 Tool   │ comming soon
+│   6 Gen4 Tool   │
 │   7 WiFi / Web  │
 │   8 OTA Update  │
 └─────────────────┘
@@ -368,7 +368,7 @@ To eliminate per-keypress SD reads at the top three levels, BambuTagger pre-load
 
 ---
 
-### 6 · Gen4 Tool (comming soon)
+### 6 · Gen4 Tool
 
 A dedicated flow for managing the GTU backdoor on **Gen4 (GTU / GDM / USCUID)** magic cards — **without** needing to write a dump first.
 
