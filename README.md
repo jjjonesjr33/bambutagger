@@ -11,7 +11,7 @@ Designed around the MIFARE Classic 1K tags embedded in Bambu Lab spools, with fu
 | Category | Details |
 |----------|---------|
 | **RFID** | Read, clone, and write Bambu Lab MIFARE Classic 1K spool tags |
-| **Gen1A / Gen2 / Gen3 / Gen4 magic card support** | Gen1A: 0x40/0x43 backdoor, all 64 blocks verbatim; Gen4 (GTU/GDM): CF-command backdoor, all 64 blocks verbatim; Gen3 (APDU): block 0 via `90 F0 CC CC` APDU; Gen2 (CUID/FUID): implicit detection via block 0 write |
+| **Gen1A / Gen2 / Gen3 / Gen4 magic card support** | Gen1A: 0x40/0x43 backdoor, all 64 blocks verbatim; Gen4 (GTU/GDM): CF-command backdoor, all 64 blocks verbatim; Gen3 (APDU): block 0 via `90 F0 CC CC` APDU; Gen2 (CUID/FUID): implicit detection via block 0 write; **Tag Tool** also probes Gen2 cards for block 0 lock/unlock via access-bit rewrite |
 | **Key derivation** | HKDF-SHA256 with Bambu Lab salt — no hardcoded keys |
 | **OLED menu** | 8-item navigable menu on a 128×64 SH110X / SH1106G display |
 | **Rotary encoder** | ENC11/KY-040 encoder for scroll + click navigation |
@@ -135,7 +135,7 @@ Press and hold, or select **\<\< MENU** (always the first row in any browser) to
 │   3 Write Dump  │
 │   4 GitHub Lib  │
 │   5 BambuMan    │
-│   6 Gen4 Tool   │
+│   6 Tag Tool    │
 │   7 WiFi / Web  │
 │   8 OTA Update  │
 └─────────────────┘
@@ -210,6 +210,22 @@ Row 0 of the list is always a navigation shortcut:
 - Entries are sorted: subdirectories first (prefix `>`), then `.bin` files.
 - Up to 4 rows are visible at a time; the list scrolls with the cursor.
 - After a GitHub download completes, the OLED shows a write-confirm screen so you can write the tag immediately (see **§ 4 · GitHub Lib**). The FAT browser is also pre-navigated to the downloaded file's folder so you can write it later from **3 · Write Dump**.
+
+#### Web-triggered write — OLED feedback
+
+When a write is triggered from the **web UI Files tab** (`POST /api/writetag`), the OLED displays live progress identical to the OTA progress screen:
+
+| Phase | OLED display |
+|-------|-------------|
+| Waiting for card | `Write Dump` / `Web: wait Xs...` + 0 % bar (countdown refreshes every 500 ms) |
+| Card detected | `Write Dump` / `Web: writing...` + 0 % bar |
+| Writing (per sector) | `Write Dump` / `Web: writing...` + live sector bar (1 / 16 → 16 / 16) |
+| Success | brief `Web: Done!` + full bar → then `Write complete!` result screen |
+| Partial | brief `Web: X/16 partial` → then `Partial! X/16 sec` result screen |
+| Failed | brief `Web: FAILED!` → then `Write failed!` result screen |
+| Timeout | brief `Web: timeout!` → then `Timeout. No card.` result screen |
+
+The OLED-native write flow (started from menu item **3 · Write Dump**) is unchanged.
 
 ### 4 · GitHub Lib
 Browse the [Bambu Lab RFID Library](https://github.com/queengooborg/Bambu-Lab-RFID-Library) repository **directly on the OLED** — no PC required.  Requires WiFi (STA) connectivity.
@@ -368,18 +384,19 @@ To eliminate per-keypress SD reads at the top three levels, BambuTagger pre-load
 
 ---
 
-### 6 · Gen4 Tool
+### 6 · Tag Tool
 
-A dedicated flow for managing the GTU backdoor on **Gen4 (GTU / GDM / USCUID)** magic cards — **without** needing to write a dump first.
+A dedicated flow for managing magic-card backdoors — **without** needing to write a dump first.  Handles both **Gen4 (GTU / GDM / USCUID)** and **Gen2 (CUID / FUID)** cards.
 
 #### How to use
 
-1. Select **6 Gen4 Tool** from the main menu.
+1. Select **6 Tag Tool** from the main menu.
 2. When prompted, place the card on the reader (20 s window, teal LED pulse).
-3. The sketch probes the card via `CF 00000000 CC`:
-   - **Not a Gen4 card** → shows a message and returns to the menu.
-   - **Gen4 confirmed** → reads the current GTU mode byte and displays it in the header.
-4. An action menu appears:
+3. The sketch first probes for **Gen4** via `CF 00000000 CC`:
+
+**Branch A — Gen4 confirmed** (responds `00 00 00 02 AA`)
+
+Reads the current GTU mode byte and displays it in the header, then shows the action menu:
 
 ```
 ┌──────────────────────┐
@@ -398,25 +415,52 @@ A dedicated flow for managing the GTU backdoor on **Gen4 (GTU / GDM / USCUID)** 
 
 > ⚠️ **Sealing is irreversible via software.** A sealed card (`0x00`) disables its own backdoor, so `gen4Unlock()` will fail on a sealed card. Physical re-flashing of the chip is the only recovery path.
 
+**Branch B — Not a Gen4 card**
+
+The card is re-selected and probed for **Gen2 / CUID / FUID** by attempting a normal-auth write to block 0.  Keys tried in order: Bambu-derived Key B → Key A → default `0xFF×6`.
+
+- **Gen2 confirmed** → reads block 0's current access-condition bits (`AC`) and shows the header `Gen2 blk0: open` or `Gen2 blk0: LOCKED`, then shows:
+
+```
+┌──────────────────────┐
+│  Gen2  blk0: open    │
+│> Skip                │
+│  Lock Blk0           │
+│  Unlock Blk0         │
+└──────────────────────┘
+```
+
+| Option | Access condition (AC) | Effect |
+|--------|----------------------|--------|
+| **Skip** (default) | unchanged | No change; return to menu |
+| **Lock Blk0** | `010` | Block 0 becomes **read-only** — UID and manufacturer bytes cannot be overwritten |
+| **Unlock Blk0** | `000` | Block 0 is **read/write** again — Gen2 writability restored |
+
+- **Standard MIFARE** (neither Gen4 nor Gen2) → OLED shows `Block 0 locked` `(hardware)` and returns to the menu.
+
 #### Post-write seal/unlock prompt
 
-The same 3-option mini-menu also appears automatically after a **successful Gen4 write** (all 16 sectors OK) in the Write Dump flow, giving you the option to seal or unlock the card immediately after programming.
+The same Gen4 3-option mini-menu (Skip / Seal / Unlock) also appears automatically after a **successful Gen4 write** (all 16 sectors OK) in the Write Dump flow, giving you the option to seal or unlock the card immediately after programming.
 
 | Encoder action | Result |
 |----------------|--------|
-| Click on chosen option | Execute Seal / Unlock / Skip |
+| Click on chosen option | Execute action |
 | 20 s timeout | Auto-Skip |
 
-#### LED colours during Gen4 Tool
+#### LED colours during Tag Tool
 
 | State | LED |
 |-------|-----|
 | Waiting for card | 🩵 Teal pulse |
-| Seal success | 🟢 2 × green flash |
-| Seal failure | 🔴 2 × red flash |
-| Unlock success | 🟢 2 × green flash |
-| Unlock failure | 🔴 2 × red flash |
-| Not a Gen4 card | 🟠 2 × amber flash |
+| Gen4 — Seal success | 🟢 2 × green flash |
+| Gen4 — Seal failure | 🔴 2 × red flash |
+| Gen4 — Unlock success | 🟢 2 × green flash |
+| Gen4 — Unlock failure | 🔴 2 × red flash |
+| Gen2 — Lock Blk0 success | 🟢 2 × green flash |
+| Gen2 — Lock Blk0 failure | 🔴 2 × red flash |
+| Gen2 — Unlock Blk0 success | 🟢 2 × green flash |
+| Gen2 — Unlock Blk0 failure | 🔴 2 × red flash |
+| Standard card (not Gen4/Gen2) | 🟠 2 × amber flash |
 
 ---
 
@@ -561,7 +605,7 @@ All endpoints return JSON unless noted.
 | `POST` | `/api/download` | `{"url":"…","path":"…"}` — download raw file to FAT |
 | `GET` | `/api/files?dir=<path>` | FAT directory listing; returns `{path, entries:[{name,isDir,size?}]}` |
 | `POST` | `/api/delete` | `{"file":"…"}` — delete a FAT file |
-| `POST` | `/api/writetag` | `{"path":"…"}` — load FAT dump and start tag-write (20 s window) |
+| `POST` | `/api/writetag` | `{"path":"…"}` — load FAT dump and start tag-write (20 s window); OLED shows live sector progress |
 | `POST` | `/api/upload` | `multipart/form-data` field `file` — upload a `.bin` |
 | `GET` | `/api/token` | Returns `{"token":"ghp_…"}` (masked after first 4 chars) |
 | `POST` | `/api/token` | `{"token":"…"}` — save GitHub API token to NVS |
@@ -601,10 +645,12 @@ All endpoints return JSON unless noted.
 | OTA — downloading / flashing | 🔵 Pulsing cyan → 🟡 solid yellow during flash |
 | OTA — flash success | 🟢 3 × green flash |
 | OTA — flash failure | 🔴 3 × red flash |
-| Gen4 Tool — waiting for card | 🩵 Teal pulse |
-| Gen4 Tool — Seal / Unlock success | 🟢 2 × green flash |
-| Gen4 Tool — Seal / Unlock failure | 🔴 2 × red flash |
-| Gen4 Tool — not a Gen4 card | 🟠 2 × amber flash |
+| Tag Tool — waiting for card | 🩵 Teal pulse |
+| Tag Tool — Gen4 Seal / Unlock success | 🟢 2 × green flash |
+| Tag Tool — Gen4 Seal / Unlock failure | 🔴 2 × red flash |
+| Tag Tool — Gen2 Lock / Unlock Blk0 success | 🟢 2 × green flash |
+| Tag Tool — Gen2 Lock / Unlock Blk0 failure | 🔴 2 × red flash |
+| Tag Tool — standard card (not Gen4/Gen2) | 🟠 2 × amber flash |
 
 ---
 

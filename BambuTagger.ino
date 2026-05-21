@@ -119,7 +119,7 @@
 #define AP_SSID "BambuTagger"
 #define AP_PASS "bambu1234"
 
-#define FIRMWARE_VERSION "1.7.6"          // bumped by release workflow tag
+#define FIRMWARE_VERSION "1.7.7"          // bumped by release workflow tag
 #define OTA_REPO         "VID-PRO/BambuTagger"
 
 #define GITHUB_API_HOST "api.github.com"
@@ -232,6 +232,8 @@ TagInfo currentTag;  // most recently read
 TagInfo sourceTag;   // for clone operation
 uint8_t dumpBuf[DUMP_SIZE];
 char selectedDumpPath[64] = "";
+bool    g_webWrite       = false;          // true when /api/writetag triggered the write
+void  (*g_writeSectorCb)(int, int) = nullptr; // (sectDone, sectTotal) progress callback
 
 // Pages to display for a read tag
 int tagPage = 0;
@@ -277,7 +279,7 @@ static const char* MENU_ITEMS[] = {
   "3 Write Tag",
   "4 GitHub Lib",
   "5 BambuMan Lib",
-  "6 Gen4 Tool",
+  "6 Tag Tool",
   "7 WiFi / Web",
   "8 OTA Update"
 };
@@ -830,6 +832,161 @@ static void ledFlash(uint8_t r, uint8_t g, uint8_t b,
   ledSet(restoreR, restoreG, restoreB);
 }
 
+// ──────────────────────────────────────────────────────────────
+//  Gen2 (CUID/FUID) block-0 access-bit lock / unlock
+// ──────────────────────────────────────────────────────────────
+/* MIFARE Classic access-bit layout in the sector trailer (bytes 6-8):
+   Byte 6: ~C2[3] ~C2[2] ~C2[1] ~C2[0] ~C1[3] ~C1[2] ~C1[1] ~C1[0]
+   Byte 7:  C1[3]  C1[2]  C1[1]  C1[0] ~C3[3] ~C3[2] ~C3[1] ~C3[0]
+   Byte 8:  C3[3]  C3[2]  C3[1]  C3[0]  C2[3]  C2[2]  C2[1]  C2[0]
+   ab[0..2] maps to bytes 6-8 of the trailer block.
+   blkInSec = 0..3 (0-2 = data blocks, 3 = trailer itself).
+
+   Useful data-block access conditions:
+     AC 000 (C1=0,C2=0,C3=0): R/W with Key A or B — default / unlocked
+     AC 010 (C1=0,C2=1,C3=0): Read A|B, Write never — locked (read-only)  */
+
+/* Decode the 3-bit access condition for block blkInSec (0-3). */
+static uint8_t mfGetAC(const uint8_t ab[3], uint8_t blkInSec) {
+  uint8_t c1 = (ab[1] >> (4 + blkInSec)) & 1;  // byte7 bit(4+n)
+  uint8_t c2 = (ab[2] >>       blkInSec)  & 1;  // byte8 bit(n)
+  uint8_t c3 = (ab[2] >> (4 + blkInSec)) & 1;  // byte8 bit(4+n)
+  return (c3 << 2) | (c2 << 1) | c1;
+}
+
+/* Encode a 3-bit access condition (b0=C1,b1=C2,b2=C3) into ab[0..2]. */
+static void mfSetAC(uint8_t ab[3], uint8_t blkInSec, uint8_t ac) {
+  uint8_t c1 = (ac >> 0) & 1, c2 = (ac >> 1) & 1, c3 = (ac >> 2) & 1;
+  uint8_t bit  = 1u <<      blkInSec;
+  uint8_t bit4 = 1u << (4 + blkInSec);
+  // byte 6: ~C2[n] at bit4, ~C1[n] at bit
+  if (!c2) ab[0] |= bit4; else ab[0] &= (uint8_t)~bit4;
+  if (!c1) ab[0] |= bit;  else ab[0] &= (uint8_t)~bit;
+  // byte 7: C1[n] at bit4, ~C3[n] at bit
+  if ( c1) ab[1] |= bit4; else ab[1] &= (uint8_t)~bit4;
+  if (!c3) ab[1] |= bit;  else ab[1] &= (uint8_t)~bit;
+  // byte 8: C3[n] at bit4, C2[n] at bit
+  if ( c3) ab[2] |= bit4; else ab[2] &= (uint8_t)~bit4;
+  if ( c2) ab[2] |= bit;  else ab[2] &= (uint8_t)~bit;
+}
+
+/* Return true if block 0 is writable (confirms Gen2 magic mode).
+   Card must already be selected. Authenticates sector 0 and attempts
+   writing the same block-0 bytes back; succeeds only on Gen2 cards. */
+static bool gen2ProbeWritable(const uint8_t uid[4]) {
+  uint8_t kA[16][6], kB[16][6];
+  bambuDeriveKeys(uid, kA, kB);
+  MFRC522::MIFARE_Key mA, mB, mDef;
+  memcpy(mA.keyByte, kA[0], 6);
+  memcpy(mB.keyByte, kB[0], 6);
+  memset(mDef.keyByte, 0xFF, 6);
+
+  bool authed = tryAuth(3, &mA, true) || tryAuth(3, &mB, false) || tryAuth(3, &mDef, true);
+  if (!authed) { DBGLN("[GEN2] probe: auth fail"); return false; }
+
+  uint8_t blk[18]; uint8_t sz = 18;
+  if (rfid.MIFARE_Read(0, blk, &sz) != MFRC522::STATUS_OK) {
+    DBGLN("[GEN2] probe: read blk0 fail"); return false;
+  }
+  MFRC522::StatusCode ws = rfid.MIFARE_Write(0, blk, 16);
+  DBGF("[GEN2] probe blk0 write: %s\n",
+       ws == MFRC522::STATUS_OK ? "Gen2 OK" : "standard MIFARE (locked)");
+  return ws == MFRC522::STATUS_OK;
+}
+
+/* Lock block 0 on a Gen2 card: sets sector-0 block-0 AC to 010 (read-only).
+   Tries Key B then Key A to write the trailer (B required in some configs). */
+static bool gen2LockBlock0(const uint8_t uid[4]) {
+  uint8_t kA[16][6], kB[16][6];
+  bambuDeriveKeys(uid, kA, kB);
+  MFRC522::MIFARE_Key mA, mB, mDef;
+  memcpy(mA.keyByte, kA[0], 6);
+  memcpy(mB.keyByte, kB[0], 6);
+  memset(mDef.keyByte, 0xFF, 6);
+
+  // Read the sector-0 trailer
+  bool authed = tryAuth(3, &mA, true) || tryAuth(3, &mB, false) || tryAuth(3, &mDef, true);
+  if (!authed) { DBGLN("[GEN2] lock: read-auth fail"); return false; }
+  uint8_t trailer[18]; uint8_t sz = 18;
+  if (rfid.MIFARE_Read(3, trailer, &sz) != MFRC522::STATUS_OK) {
+    DBGLN("[GEN2] lock: read trailer fail"); return false;
+  }
+
+  uint8_t ab[3] = { trailer[6], trailer[7], trailer[8] };
+  uint8_t curAC = mfGetAC(ab, 0);
+  DBGF("[GEN2] lock: block 0 AC before=%d\n", curAC);
+  if (curAC == 0b010) { DBGLN("[GEN2] block 0 already locked"); return true; }
+
+  mfSetAC(ab, 0, 0b010);  // read-only
+  trailer[6] = ab[0]; trailer[7] = ab[1]; trailer[8] = ab[2];
+
+  // Write trailer — Key B first (often required to write access bits)
+  rfid.PCD_StopCrypto1();
+  authed = tryAuth(3, &mB, false) || tryAuth(3, &mA, true) || tryAuth(3, &mDef, false);
+  if (!authed) { DBGLN("[GEN2] lock: write-auth fail"); return false; }
+  MFRC522::StatusCode ws = rfid.MIFARE_Write(3, trailer, 16);
+  DBGF("[GEN2] lock trailer write: %s\n", ws == MFRC522::STATUS_OK ? "OK" : "FAIL");
+  return ws == MFRC522::STATUS_OK;
+}
+
+/* Unlock block 0 on a Gen2 card: restores AC to 000 (read-write). */
+static bool gen2UnlockBlock0(const uint8_t uid[4]) {
+  uint8_t kA[16][6], kB[16][6];
+  bambuDeriveKeys(uid, kA, kB);
+  MFRC522::MIFARE_Key mA, mB, mDef;
+  memcpy(mA.keyByte, kA[0], 6);
+  memcpy(mB.keyByte, kB[0], 6);
+  memset(mDef.keyByte, 0xFF, 6);
+
+  bool authed = tryAuth(3, &mB, false) || tryAuth(3, &mA, true) || tryAuth(3, &mDef, false);
+  if (!authed) { DBGLN("[GEN2] unlock: auth fail"); return false; }
+  uint8_t trailer[18]; uint8_t sz = 18;
+  if (rfid.MIFARE_Read(3, trailer, &sz) != MFRC522::STATUS_OK) {
+    DBGLN("[GEN2] unlock: read trailer fail"); return false;
+  }
+
+  uint8_t ab[3] = { trailer[6], trailer[7], trailer[8] };
+  uint8_t curAC = mfGetAC(ab, 0);
+  DBGF("[GEN2] unlock: block 0 AC before=%d\n", curAC);
+  if (curAC == 0b000) { DBGLN("[GEN2] block 0 already unlocked"); return true; }
+
+  mfSetAC(ab, 0, 0b000);  // fully accessible
+  trailer[6] = ab[0]; trailer[7] = ab[1]; trailer[8] = ab[2];
+
+  rfid.PCD_StopCrypto1();
+  authed = tryAuth(3, &mB, false) || tryAuth(3, &mA, true) || tryAuth(3, &mDef, false);
+  if (!authed) { DBGLN("[GEN2] unlock: re-auth fail"); return false; }
+  MFRC522::StatusCode ws = rfid.MIFARE_Write(3, trailer, 16);
+  DBGF("[GEN2] unlock trailer write: %s\n", ws == MFRC522::STATUS_OK ? "OK" : "FAIL");
+  return ws == MFRC522::STATUS_OK;
+}
+
+/* OLED action menu for Gen2 block-0 lock/unlock.
+   sel: 0=Skip  1=Lock Blk0  2=Unlock Blk0 */
+static void drawGen2ActionMenu(int sel, const char* header) {
+  static const char* OPTS[] = { "Skip", "Lock Blk0", "Unlock Blk0" };
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  // Header row (inverted)
+  oled.fillRect(0, 0, 128, 10, SH110X_WHITE);
+  oled.setTextColor(SH110X_BLACK);
+  oled.setCursor(2, 1);
+  oled.print(header);
+  oled.setTextColor(SH110X_WHITE);
+  for (int i = 0; i < 3; i++) {
+    int y = 14 + i * 16;
+    if (i == sel) {
+      oled.fillRect(0, y - 1, 128, 12, SH110X_WHITE);
+      oled.setTextColor(SH110X_BLACK);
+    } else {
+      oled.setTextColor(SH110X_WHITE);
+    }
+    oled.setCursor(4, y);
+    oled.print(OPTS[i]);
+  }
+  oled.display();
+}
+
 /* Write a 1024-byte dump to a card.
    Card-type detection order:
      1. Gen1A  – responds to 0x40/0x43 backdoor; all 64 blocks written verbatim
@@ -898,6 +1055,7 @@ int rfidWriteDump(const uint8_t* buf, bool /*isMagicCard — now auto-detected v
       }
       DBGF("[WRITE] sector %02d -> %s\n", sec, sectorOk ? "OK" : "FAIL");
       if (sectorOk) sectorsOk++;
+      if (g_writeSectorCb) g_writeSectorCb(sec + 1, NUM_SECTORS);
     }
 
   // ── Gen4 / Gen3 / Gen2 / Normal path ──────────────────────────────────────
@@ -924,6 +1082,7 @@ int rfidWriteDump(const uint8_t* buf, bool /*isMagicCard — now auto-detected v
         }
         DBGF("[WRITE] sector %02d -> %s\n", sec, sectorOk ? "OK" : "FAIL");
         if (sectorOk) sectorsOk++;
+        if (g_writeSectorCb) g_writeSectorCb(sec + 1, NUM_SECTORS);
       }
 
       // ── Gen4 seal/unlock prompt (only if all sectors written successfully) ─
@@ -1058,6 +1217,7 @@ int rfidWriteDump(const uint8_t* buf, bool /*isMagicCard — now auto-detected v
         }
 
         if (sectorOk) sectorsOk++;
+        if (g_writeSectorCb) g_writeSectorCb(sec + 1, NUM_SECTORS);
 
         // ── Gen2 post-sector-0 re-select ─────────────────────────────────
         // Writing block 0 changes the card's UID. The MFRC522 crypto engine
@@ -2169,8 +2329,8 @@ function loadStatus() {
         <tr><td>IP</td><td>${d.ip}</td></tr>
         <tr><td>Mode</td><td>${d.ap_mode?'Access Point (AP)':'Station (STA)'}</td></tr>
         <tr><td>Free Heap</td><td>${d.heap} bytes</td></tr>
-        <tr><td>FAT</td><td>${d.fat_used} / ${d.fat_total} bytes</td></tr>
-        <tr><td>Selected Tag</td><td>${d.selected_dump||'— none —'}</td></tr>
+        <tr><td>FAT</td><td>${d.fat_used / 1024} / ${d.fat_total / 1024} kbytes</td></tr>
+        <tr><td>Last Written Tag</td><td>${d.selected_dump||'— none —'}</td></tr>
       </table>`;
 
     if(d.last_tag && d.last_tag.valid) {
@@ -3114,6 +3274,7 @@ void apiWriteTag() {
   f.close();
   strncpy(selectedDumpPath, path.c_str(), sizeof(selectedDumpPath) - 1);
   selectedDumpPath[sizeof(selectedDumpPath) - 1] = '\0';
+  g_webWrite = true;           // flag: show OLED progress during write
   appState = S_DUMP_WRITE;
   resp["ok"] = true;
   resp["message"] = "Place tag on RFID reader within 20 s";
@@ -3201,6 +3362,27 @@ void otaDrawProgress(int pct, const char* label) {
   char pctStr[8]; snprintf(pctStr, sizeof(pctStr), "%d%%", pct);
   oled.setCursor(56, 50); oled.print(pctStr);
   oled.display();
+}
+
+// Draw sector-progress OLED screen for web-triggered writes
+void drawWriteScreen(const char* phase, int sectDone, int sectTotal) {
+  oled.clearDisplay();
+  oled.setTextSize(1);
+  oled.setCursor(0, 0);  oled.println("Write Dump");
+  oled.setCursor(0, 12); oled.println(phase);
+  int pct = (sectTotal > 0) ? (sectDone * 100 / sectTotal) : 0;
+  oled.drawRect(4, 36, 120, 10, SH110X_WHITE);
+  int filled = (int)((long)pct * 116 / 100);
+  if (filled > 0) oled.fillRect(6, 38, filled, 6, SH110X_WHITE);
+  char info[20];
+  snprintf(info, sizeof(info), "%d / %d sec", sectDone, sectTotal);
+  oled.setCursor(36, 50); oled.print(info);
+  oled.display();
+}
+
+// Sector-progress callback — called by rfidWriteDump() after each sector
+static void writeProgressCbFn(int done, int total) {
+  drawWriteScreen("Web: writing...", done, total);
 }
 
 // Internal OTA flash — used by both OLED flow and web API
@@ -5206,11 +5388,11 @@ void processCloneTarget() {
 }
 
 // ──────────────────────────────────────────────────────────────
-//  Gen4 Tool  — standalone Seal / Unlock flow
+//  Tag Tool  — standalone Seal / Unlock flow
 // ──────────────────────────────────────────────────────────────
 void processGen4Manage() {
   DBGLN("[GEN4] processGen4Manage: waiting for card…");
-  showStatus("Gen4 Tool\nPlace card on\nreader…\n\nPress to cancel");
+  showStatus("Tag Tool\nPlace card on\nreader\n\nPress to cancel");
   ledSet(0, 40, 80);  // teal
 
   unsigned long deadline = millis() + 20000;
@@ -5231,20 +5413,121 @@ void processGen4Manage() {
     bool isG4 = gen4Detect();
 
     if (!isG4) {
-      DBGLN("[GEN4] Not a Gen4 card");
-      rfid.PICC_HaltA();
+      DBGLN("[GEN4] Not a Gen4 card — probing Gen2...");
+      // Re-select after the Gen4 probe may have confused the card
+      if (!rfidReSelect()) {
+        DBGLN("[GEN2] re-select after Gen4 probe failed");
+        ledFlash(255, 128, 0, 2);
+        showStatus("Card Tool\nCard lost after\nGen4 probe\n\nClick to return.");
+        unsigned long tw = millis();
+        while (millis() - tw < 5000) {
+          httpServer.handleClient(); encUpdate();
+          if (encGetClick() || encGetDelta() != 0) break;
+          delay(10);
+        }
+        enterMainMenu(); return;
+      }
+
+      uint8_t uid4[4];
+      memcpy(uid4, rfid.uid.uidByte, 4);
+
+      bool isG2 = gen2ProbeWritable(uid4);
       rfid.PCD_StopCrypto1();
-      ledFlash(255, 128, 0, 2);
-      showStatus("Gen4 Tool\nNot a Gen4 card\n\nClick to return.");
-      unsigned long t2 = millis();
-      while (millis() - t2 < 5000) {
+
+      if (!isG2) {
+        DBGLN("[GEN2] Not a Gen2 card — standard MIFARE");
+        rfid.PICC_HaltA();
+        ledFlash(255, 128, 0, 2);
+        showStatus("Card Tool\n\nStandard MIFARE\nBlock 0 locked\n(hardware)\n\nClick to return.");
+        unsigned long tw = millis();
+        while (millis() - tw < 5000) {
+          httpServer.handleClient(); encUpdate();
+          if (encGetClick() || encGetDelta() != 0) break;
+          delay(10);
+        }
+        enterMainMenu(); return;
+      }
+
+      // ── Gen2 confirmed — read current block-0 AC for header ──────────
+      DBGLN("[GEN2] Gen2 confirmed — block 0 is writable");
+      rfid.PICC_HaltA();
+      if (!rfidReSelect()) {
+        showStatus("Card Tool\nGen2 card lost\n\nClick to return.");
+        appState = S_WIFI_INFO; return;
+      }
+      memcpy(uid4, rfid.uid.uidByte, 4);
+
+      char g2hdr[22];
+      snprintf(g2hdr, sizeof(g2hdr), "Gen2 blk0: open");
+      {
+        uint8_t kA[16][6], kB[16][6];
+        bambuDeriveKeys(uid4, kA, kB);
+        MFRC522::MIFARE_Key mA, mDef;
+        memcpy(mA.keyByte, kA[0], 6);
+        memset(mDef.keyByte, 0xFF, 6);
+        if (tryAuth(3, &mA, true) || tryAuth(3, &mDef, true)) {
+          uint8_t tr[18]; uint8_t sz2 = 18;
+          if (rfid.MIFARE_Read(3, tr, &sz2) == MFRC522::STATUS_OK) {
+            uint8_t ab[3] = { tr[6], tr[7], tr[8] };
+            uint8_t ac = mfGetAC(ab, 0);
+            DBGF("[GEN2] current block 0 AC=%d\n", ac);
+            if (ac == 0b010) snprintf(g2hdr, sizeof(g2hdr), "Gen2 blk0: LOCKED");
+          }
+        }
+        rfid.PCD_StopCrypto1();
+        rfid.PICC_HaltA();
+      }
+
+      // ── Show Gen2 action menu ─────────────────────────────────────────
+      int g2sel = 0;
+      drawGen2ActionMenu(g2sel, g2hdr);
+      unsigned long t0 = millis();
+      bool g2confirmed = false;
+      while (millis() - t0 < 20000) {
         httpServer.handleClient();
         encUpdate();
+        int d = encGetDelta();
+        if (d > 0) { g2sel = (g2sel + 1) % 3; drawGen2ActionMenu(g2sel, g2hdr); t0 = millis(); }
+        if (d < 0) { g2sel = (g2sel - 1 + 3) % 3; drawGen2ActionMenu(g2sel, g2hdr); t0 = millis(); }
+        if (encGetClick()) { g2confirmed = true; break; }
+        delay(10);
+      }
+
+      if (!g2confirmed || g2sel == 0) {
+        DBGLN("[GEN2] action skipped / timeout");
+        showStatus("Gen2 Tool\nNo action taken\n\nClick to return.");
+      } else {
+        // Re-select for the actual operation
+        if (!rfidReSelect()) {
+          showStatus("Gen2 Tool\nCard removed\n\nClick to return.");
+          appState = S_WIFI_INFO; return;
+        }
+        memcpy(uid4, rfid.uid.uidByte, 4);
+
+        if (g2sel == 1) {
+          showStatus("Gen2 Tool\n\nLocking Blk0...");
+          bool ok = gen2LockBlock0(uid4);
+          DBGF("[GEN2] lock: %s\n", ok ? "OK" : "FAIL");
+          rfid.PCD_StopCrypto1(); rfid.PICC_HaltA();
+          if (ok) { ledFlash(0, 255, 0, 2); showStatus("Gen2 Tool\n\nBlk0 Locked!\nRead-only now\n\nClick to return."); }
+          else    { ledFlash(255, 0, 0, 2); showStatus("Gen2 Tool\n\nLock FAILED\nCheck keys/card\n\nClick to return."); }
+        } else {
+          showStatus("Gen2 Tool\n\nUnlocking Blk0...");
+          bool ok = gen2UnlockBlock0(uid4);
+          DBGF("[GEN2] unlock: %s\n", ok ? "OK" : "FAIL");
+          rfid.PCD_StopCrypto1(); rfid.PICC_HaltA();
+          if (ok) { ledFlash(0, 255, 0, 2); showStatus("Gen2 Tool\n\nBlk0 Unlocked!\nWritable again\n\nClick to return."); }
+          else    { ledFlash(255, 0, 0, 2); showStatus("Gen2 Tool\n\nUnlock FAILED\nCard may need\nBambu-derived key\n\nClick to return."); }
+        }
+      }
+
+      unsigned long tw = millis();
+      while (millis() - tw < 8000) {
+        httpServer.handleClient(); encUpdate();
         if (encGetClick() || encGetDelta() != 0) break;
         delay(10);
       }
-      enterMainMenu();
-      return;
+      enterMainMenu(); return;
     }
 
     // ── Gen4 confirmed — read current mode ─────────────────
@@ -5275,13 +5558,13 @@ void processGen4Manage() {
 
     if (confirmed && g4sel != 0) {
       if (g4sel == 1) {
-        showStatus("Gen4 Tool\n\nSealing...");
+        showStatus("Tag Tool\n\nSealing...");
         bool ok = gen4Seal();
         DBGF("[GEN4] Seal: %s\n", ok ? "OK" : "FAIL");
         if (ok) { showStatus("Gen4 Sealed!\nMagic mode OFF\nStandard MIFARE\n\nClick to return."); ledFlash(0, 255, 0, 2); }
         else    { showStatus("Gen4 Seal FAIL\n\nClick to return."); ledFlash(255, 0, 0, 2); }
       } else {  // g4sel == 2
-        showStatus("Gen4 Tool\n\nUnlocking...");
+        showStatus("Tag Tool\n\nUnlocking...");
         bool ok = gen4Unlock();
         DBGF("[GEN4] Unlock: %s\n", ok ? "OK" : "FAIL");
         if (ok) { showStatus("Gen4 Unlocked!\nMagic mode ON\n\nClick to return."); ledFlash(0, 255, 0, 2); }
@@ -5289,7 +5572,7 @@ void processGen4Manage() {
       }
     } else {
       DBGLN("[GEN4] Action skipped / timeout");
-      showStatus("Gen4 Tool\nNo action taken\n\nClick to return.");
+      showStatus("Tag Tool\nNo action taken\n\nClick to return.");
     }
 
     rfid.PICC_HaltA();
@@ -5309,7 +5592,7 @@ void processGen4Manage() {
   // Timeout
   DBGLN("[GEN4] Timeout — no card detected");
   ledFlash(255, 0, 0, 2);
-  showStatus("Gen4 Tool\nNo card detected\n\nClick to return.");
+  showStatus("Tag Tool\nNo card detected\n\nClick to return.");
   appState = S_WIFI_INFO;  // "any key returns" state
 }
 
@@ -5325,50 +5608,78 @@ void processDumpWrite() {
        preview.spoolWeight);
   ledSetTagColor(&preview);
 
+  // Web-triggered: install sector-progress callback and show waiting screen
+  if (g_webWrite) {
+    g_writeSectorCb = writeProgressCbFn;
+    drawWriteScreen("Web: waiting...", 0, NUM_SECTORS);
+  }
+
   unsigned long deadline = millis() + 20000;
+  unsigned long lastDraw  = 0;
   while (millis() < deadline) {
     httpServer.handleClient();
     encUpdate();
     if (encGetClick()) {
+      g_webWrite = false;
+      g_writeSectorCb = nullptr;
       enterMainMenu();
       return;
     }
+    // Refresh countdown every 500 ms when web-triggered
+    if (g_webWrite && millis() - lastDraw > 500) {
+      int secsLeft = (int)((deadline - millis()) / 1000);
+      char ph[24];
+      snprintf(ph, sizeof(ph), "Web: wait %ds...", secsLeft);
+      drawWriteScreen(ph, 0, NUM_SECTORS);
+      lastDraw = millis();
+    }
     if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
-      DBGF("[DUMP]  Card detected UID: %02X %02X %02X %02X – starting write...\n",
+      DBGF("[DUMP]  Card detected UID: %02X %02X %02X %02X â starting write...\n",
            rfid.uid.uidByte[0], rfid.uid.uidByte[1],
            rfid.uid.uidByte[2], rfid.uid.uidByte[3]);
       ledSet(255, 255, 0);  // yellow = writing
-      showStatus("Writing tag\x85");
+      if (g_webWrite) {
+        drawWriteScreen("Web: writing...", 0, NUM_SECTORS);
+      } else {
+        showStatus("Writing tag");
+      }
       int sectOk = rfidWriteDump(dumpBuf, true);
       DBGF("[DUMP]  Write result: %d/%d sectors OK\n", sectOk, NUM_SECTORS);
+      g_writeSectorCb = nullptr;
       bool ok = (sectOk == NUM_SECTORS);
       bool partial = (sectOk > 0 && sectOk < NUM_SECTORS);
       if (ok) {
-        ledFlash(0, 255, 0, 3);  // 3× green = success
+        ledFlash(0, 255, 0, 3);  // 3Ã green = success
+        if (g_webWrite) { drawWriteScreen("Web: Done!", NUM_SECTORS, NUM_SECTORS); delay(1500); }
         showStatus("Write complete!\n\nClick to return.");
       } else if (partial) {
-        ledFlash(255, 165, 0, 3); // 3× amber = partial write
+        ledFlash(255, 165, 0, 3); // 3Ã amber = partial write
         char msg[64];
         snprintf(msg, sizeof(msg), "Partial! %d/16 sec\nCard keyed wrong?\n\nClick to return.", sectOk);
+        if (g_webWrite) {
+          char ph2[28]; snprintf(ph2, sizeof(ph2), "Web: %d/16 partial", sectOk);
+          drawWriteScreen(ph2, sectOk, NUM_SECTORS); delay(1500);
+        }
         showStatus(msg);
       } else {
-        ledFlash(255, 0, 0, 3);  // 3× red = fail
+        ledFlash(255, 0, 0, 3);  // 3Ã red = fail
+        if (g_webWrite) { drawWriteScreen("Web: FAILED!", 0, NUM_SECTORS); delay(1500); }
         showStatus("Write failed!\nTry a magic/FUID\ncard.\n\nClick to return.");
       }
+      g_webWrite = false;
       appState = S_WIFI_INFO;
       return;
     }
     delay(18);
   }
-  DBGLN("[DUMP]  processDumpWrite: timeout – no card.");
+  DBGLN("[DUMP]  processDumpWrite: timeout â no card.");
   ledFlash(255, 0, 0, 2);
+  if (g_webWrite) { drawWriteScreen("Web: timeout!", 0, NUM_SECTORS); delay(1500); }
   showStatus("Timeout. No card.\n\nClick to return.");
+  g_webWrite = false;
+  g_writeSectorCb = nullptr;
   appState = S_WIFI_INFO;
 }
-
-// ──────────────────────────────────────────────────────────────
-//  Arduino setup()
-// ──────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
   delay(200);  // let serial settle
