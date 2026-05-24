@@ -87,7 +87,7 @@ Schematics are here [schematics](/schematics/schematics.png)
 | Setting | Value |
 |---------|-------|
 | Board | **ESP32 Dev Module** |
-| Partition Scheme | **Custom** (select `partitions_4mb_custom.csv` — see below) |
+| Partition Scheme | **Custom** (select `partitions.csv` — see below) |
 | Flash Size | 4 MB |
 | Upload Speed | 921600 |
 | Monitor Speed | **115200** |
@@ -96,19 +96,19 @@ Schematics are here [schematics](/schematics/schematics.png)
 
 #### Custom partition table
 
-BambuTagger ships with `partitions_4mb_custom.csv` in the sketch folder.  
+BambuTagger ships with `partitions.csv` in the sketch folder.  
 Copy it into the Arduino ESP32 core's partitions directory:
 
 ```
 # macOS / Linux
-cp partitions_4mb_custom.csv \
+cp partitions.csv \
    ~/Library/Arduino15/packages/esp32/hardware/esp32/<version>/tools/partitions/
 # Windows
-copy partitions_4mb_custom.csv ^
+copy partitions.csv ^
    %LOCALAPPDATA%\Arduino15\packages\esp32\hardware\esp32\<version>\tools\partitions\
 ```
 
-Then select **Tools → Partition Scheme → partitions_4mb_custom**.
+Then select **Tools → Partition Scheme → partitions**.
 
 | Partition | Offset | Size | Notes |
 |-----------|--------|------|-------|
@@ -788,8 +788,8 @@ To disable all debug output and save flash/RAM:
 1. Install the Arduino IDE (≥ 2.x) and the [ESP32 board package](https://docs.espressif.com/projects/arduino-esp32/en/latest/installing.html).
 2. Install all libraries listed above via **Sketch → Include Library → Manage Libraries**.
 3. Open `BambuTagger.ino`.
-4. Copy `partitions_4mb_custom.csv` into the ESP32 core's `tools/partitions/` directory (see [Custom partition table](#custom-partition-table) above).
-5. Select **Tools → Board → ESP32 Dev Module** and set the partition scheme to **partitions_4mb_custom**.
+4. Copy `partitions.csv` into the ESP32 core's `tools/partitions/` directory (see [Custom partition table](#custom-partition-table) above).
+5. Select **Tools → Board → ESP32 Dev Module** and set the partition scheme to **partitions**.
 6. Click **Upload**.
 6. Open **Tools → Serial Monitor** at 115200 baud to watch the boot log.
 
@@ -822,7 +822,7 @@ git tag v1.0.1
 git push origin v1.0.1
 ```
 
-The workflow compiles the sketch on **ESP32 Arduino core 2.0.17** using the custom partition table (`partitions_4mb_custom.csv`, app = 1408 KB, ffat = 1152 KB), merges all binary parts with `esptool.py merge_bin`, and attaches four files to the GitHub release:
+The workflow compiles the sketch on **ESP32 Arduino core 2.0.17** using the custom partition table (`partitions.csv`, app = 1408 KB, ffat = 1152 KB), merges all binary parts with `esptool.py merge_bin`, and attaches four files to the GitHub release:
 
 | File | Flash address | Description |
 |------|--------------|-------------|

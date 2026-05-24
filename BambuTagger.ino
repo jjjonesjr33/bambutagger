@@ -119,7 +119,7 @@
 #define AP_SSID "BambuTagger"
 #define AP_PASS "bambu1234"
 
-#define FIRMWARE_VERSION "1.7.9"          // bumped by release workflow tag
+#define FIRMWARE_VERSION "1.8.0"          // bumped by release workflow tag
 #define OTA_REPO         "VID-PRO/BambuTagger"
 
 #define GITHUB_API_HOST "api.github.com"
@@ -486,6 +486,13 @@ static bool tryAuth(int blockAddr, MFRC522::MIFARE_Key* key, bool useKeyA) {
        key->keyByte[0], key->keyByte[1], key->keyByte[2],
        key->keyByte[3], key->keyByte[4], key->keyByte[5],
        ok ? "OK" : "FAIL");
+  if (!ok) {
+    // A failed auth can leave the card in HALT/IDLE state.
+    // Re-select so the next auth attempt starts with a clean ACTIVE-state card.
+    if (!rfidReSelect()) {
+      DBGLN("[AUTH]  re-select after auth fail — card removed");
+    }
+  }
   return ok;
 }
 
@@ -526,7 +533,8 @@ bool rfidReadBambuTag(TagInfo* t) {
 
     bool authed = tryAuth(trailer, &kA, true)
                   || tryAuth(trailer, &kB, false)
-                  || tryAuth(trailer, &kDef, true);
+                  || tryAuth(trailer, &kDef, true)
+                  || tryAuth(trailer, &kDef, false);
     DBGF("[READ]  sector %02d auth -> %s\n", sec, authed ? "OK" : "FAIL");
     if (!authed) continue;
 
@@ -1017,10 +1025,104 @@ static bool gen2UnlockBlock0(const uint8_t uid[4]) {
   return true;
 }
 
-/* OLED action menu for Gen2 block-0 lock/unlock.
-   sel: 0=Skip  1=Lock Block 0  2=Unlock Block 0 */
+/* Force a full trailer rewrite on a Gen2 card.
+   Reads the card UID, derives Bambu keys from it, and writes sector 0 trailer
+   with those keys + AC=000 (fully unlocked).  Tries:
+     A. Immediate write after fresh auth (no prior I/O)
+     B. Key A write after auth with Key A
+     C. Key B write with full halt/re-select/retry loop
+     D. Raw transceive fallback
+   Verifies by re-reading AC bits. */
+static bool gen2RepairTag(const uint8_t uid[4]) {
+  uint8_t kA[16][6], kB[16][6];
+  bambuDeriveKeys(uid, kA, kB);
+  MFRC522::MIFARE_Key mA, mB, mDef, mDefB;
+  memcpy(mA.keyByte, kA[0], 6);
+  memcpy(mB.keyByte, kB[0], 6);
+  memset(mDef.keyByte,  0xFF, 6);
+  memset(mDefB.keyByte, 0xFF, 6);
+
+  // Build trailer: UID-derived keys + AC=000 for all blocks
+  uint8_t trl[16];
+  memcpy(trl,      kA[0], 6);
+  memcpy(trl + 10, kB[0], 6);
+  {
+    uint8_t ab[3] = { 0xFF, 0x07, 0x80 };
+    for (int b = 0; b < 4; b++) mfSetAC(ab, b, 0b000);
+    trl[6] = ab[0]; trl[7] = ab[1]; trl[8] = ab[2];
+  }
+
+  // ── Helper: write trailer after fresh auth (no read in between) ──
+  auto tryWrite = [&](bool useKeyB, const char* label) -> bool {
+    MFRC522::StatusCode ws = rfid.MIFARE_Write(3, trl, 16);
+    DBGF("[GEN2] repair %s write: %s\n", label,
+         ws == MFRC522::STATUS_OK ? "OK" : "FAIL");
+    if (ws == MFRC522::STATUS_OK) {
+      // Verify: re-auth and re-read
+      rfid.PCD_StopCrypto1(); rfid.PICC_HaltA();
+      if (rfidReSelect() && (tryAuth(3, &mB, false) || tryAuth(3, &mA, true))) {
+        uint8_t v[18]; uint8_t vsz = 18;
+        if (rfid.MIFARE_Read(3, v, &vsz) == MFRC522::STATUS_OK) {
+          uint8_t vab[3] = { v[6], v[7], v[8] };
+          if (mfGetAC(vab, 0) == 0 && mfGetAC(vab, 1) == 0 && mfGetAC(vab, 2) == 0)
+            return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  // ── Attempt A: immediate write after fresh auth (no prior I/O) ──
+  rfid.PCD_StopCrypto1(); rfid.PICC_HaltA();
+  if (rfidReSelect()) {
+    if (tryAuth(3, &mB, false) || tryAuth(3, &mDefB, false)) {
+      if (tryWrite(true, "immediate B")) return true;
+    }
+    rfid.PCD_StopCrypto1();
+    if (rfidReSelect() && (tryAuth(3, &mA, true) || tryAuth(3, &mDef, true))) {
+      if (tryWrite(false, "immediate A")) return true;
+    }
+  }
+
+  // ── Attempt B: Key A write (fast path for cards with permissive AC) ──
+  rfid.PCD_StopCrypto1(); rfid.PICC_HaltA();
+  if (rfidReSelect() && (tryAuth(3, &mA, true) || tryAuth(3, &mDef, true))) {
+    if (tryWrite(false, "key A")) return true;
+  }
+
+  // ── Attempt C: Key B write with halt/re-select/retry loop ──
+  for (int attempt = 0; attempt < 3; attempt++) {
+    rfid.PCD_StopCrypto1(); rfid.PICC_HaltA();
+    if (!rfidReSelect()) break;
+    if ((tryAuth(3, &mB, false) || tryAuth(3, &mDefB, false)) && tryWrite(true, "key B"))
+      return true;
+  }
+
+  // ── Attempt D: raw transceive as last resort ──
+  rfid.PCD_StopCrypto1(); rfid.PICC_HaltA();
+  if (rfidReSelect() && (tryAuth(3, &mB, false) || tryAuth(3, &mA, true))) {
+    byte cmd[2] = { 0xA0, 0x03 };
+    byte resp[4]; byte rlen = sizeof(resp);
+    auto st = rfid.PCD_TransceiveData(cmd, 2, resp, &rlen, nullptr, 0, true);
+    if (st == MFRC522::STATUS_OK && rlen >= 1 && resp[0] == 0x0A) {
+      rlen = sizeof(resp);
+      st = rfid.PCD_TransceiveData((byte*)trl, 16, resp, &rlen, nullptr, 0, true);
+      if (st == MFRC522::STATUS_OK && rlen >= 1 && resp[0] == 0x0A) {
+        DBGLN("[GEN2] repair: raw transceive OK");
+        // Raw write gives no verification — assume it worked
+        return true;
+      }
+    }
+  }
+
+  DBGLN("[GEN2] repair: all attempts FAILED");
+  return false;
+}
+
+/* OLED action menu for Gen2 block-0 lock/unlock/repair.
+   sel: 0=Skip  1=Repair Tag  2=Lock Block 0  3=Unlock Block 0 */
 static void drawGen2ActionMenu(int sel, const char* header) {
-  static const char* OPTS[] = { "Skip", "Lock Block 0", "Unlock Block 0" };
+  static const char* OPTS[] = { "Skip", "Repair Tag", "Lock Block 0", "Unlock Block 0" };
   oled.clearDisplay();
   oled.setTextSize(1);
   // Header row (inverted)
@@ -1029,7 +1131,7 @@ static void drawGen2ActionMenu(int sel, const char* header) {
   oled.setCursor(2, 1);
   oled.print(header);
   oled.setTextColor(SH110X_WHITE);
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < 4; i++) {
     int y = 14 + i * 16;
     if (i == sel) {
       oled.fillRect(0, y - 1, 128, 12, SH110X_WHITE);
@@ -1091,12 +1193,26 @@ int rfidWriteDump(const uint8_t* buf, bool /*isMagicCard — now auto-detected v
   // ── Auto-detect card type ────────────────────────────────────────────────────────
   //  Detection order: Gen1A → Gen4 → Gen3 → Gen2 (implicit) → standard MIFARE
   bool isGen1A = gen1aUnlock();
-  if (isGen1A) DBGLN("[WRITE] Gen1A magic card detected — bypassing auth (backdoor write)");
+  if (isGen1A) {
+    DBGLN("[WRITE] Gen1A magic card detected — bypassing auth (backdoor write)");
+  } else {
+    // Re-select after Gen1A probe: the 0x40/0x43 commands may have confused the card
+    // into HALT or IDLE state, which makes all subsequent auth attempts fail even
+    // with correct keys. Antenna power-cycle forces the card back to IDLE.
+    DBGLN("[WRITE] Gen1A probe failed — re-selecting card");
+    if (!rfidReSelect()) {
+      DBGLN("[WRITE] Re-select after Gen1A — card removed");
+      rfid.PICC_HaltA();
+      rfid.PCD_StopCrypto1();
+      return 0;
+    }
+  }
 
   bool isGen4    = false;  // GTU / GDM / USCUID CF-command cards
   bool isGen3    = false;  // APDU block-0-writable cards
   bool isGen2    = false;  // detected implicitly during sector 0 normal-auth write
   int  sectorsOk = 0;
+  bool reAssemble = false;
 
   // ── Gen1A path: write all 64 blocks verbatim ─────────────────────────────
   //  Block 0 (UID) written; trailer keys kept verbatim from dump.
@@ -1218,6 +1334,31 @@ int rfidWriteDump(const uint8_t* buf, bool /*isMagicCard — now auto-detected v
       MFRC522::MIFARE_Key kDef;
       memset(kDef.keyByte, 0xFF, 6);
 
+      // ── Pre-loop Gen2 probe (sector 0, factory keys only) ────────────
+      // Fresh Gen2 magic cards have factory keys (0xFF×6).  If we can auth
+      // with factory Key B and write block 0, the card is Gen2 — do the UID
+      // swap now so the trailer write below uses correct keys for the new UID.
+      // Re-used Gen2 cards (trailer already written) will fail here (old UID
+      // keys differ from factory) and fall through to the sector 0 loop.
+      {
+        MFRC522::MIFARE_Key probekDefB;
+        memset(probekDefB.keyByte, 0xFF, 6);
+        if (tryAuth(3, &probekDefB, false)) {
+          MFRC522::StatusCode ws = rfid.MIFARE_Write(0, (uint8_t*)(buf), BYTES_PER_BLOCK);
+          rfid.PCD_StopCrypto1();
+          if (ws == MFRC522::STATUS_OK) {
+            DBGLN("[WRITE] Gen2 detected — factory auth + block 0 write OK");
+            isGen2 = true;
+            bambuDeriveKeys(buf, keysDestA, keysDestB);
+            if (!rfidReSelect()) {
+              DBGLN("[WRITE] Gen2 re-select: card lost, continuing");
+            }
+          }
+        } else {
+          DBGLN("[WRITE] Gen2 probe: factory auth FAIL — not fresh Gen2");
+        }
+      }
+
       for (int sec = 0; sec < NUM_SECTORS; sec++) {
         int trailerBlk = sec * BLOCKS_PER_SECTOR + 3;
 
@@ -1233,34 +1374,68 @@ int rfidWriteDump(const uint8_t* buf, bool /*isMagicCard — now auto-detected v
 
         bool sectorOk = true;
 
-        // ── Pass 1: write trailer (Bambu AC: requires Key A) ─────────────────
-        // Priority: factory → original card UID → new dump UID → dump-file Key A
-        bool trlAuthed = tryAuth(trailerBlk, &kDef, true)    // Key A 0xFF×6 (factory)
-                      || tryAuth(trailerBlk, &kOA,  true)    // Key A original card UID
-                      || tryAuth(trailerBlk, &kDA,  true)    // Key A new dump UID
-                      || tryAuth(trailerBlk, &kDpA, true);   // Key A from dump file
+        // ── Pass 1: write trailer ───────────────────────────────────────
+        // Try Key A then Key B variants.  If auth succeeds with Key A
+        // but the write is rejected, the card's AC bits restrict trailer
+        // writes to Key B — retry with Key B (or vice versa).
+        bool trlWritten = false;
+        bool trlAuthed = tryAuth(trailerBlk, &kDef, true)     // Key A 0xFF×6 (factory)
+                      || tryAuth(trailerBlk, &kDefB, false)   // Key B 0xFF×6 (factory)
+                      || tryAuth(trailerBlk, &kOA,  true)     // Key A original card UID
+                      || tryAuth(trailerBlk, &kOB,  false)    // Key B original card UID
+                      || tryAuth(trailerBlk, &kDA,  true)     // Key A new dump UID
+                      || tryAuth(trailerBlk, &kDB,  false)    // Key B new dump UID
+                      || tryAuth(trailerBlk, &kDpA, true)     // Key A from dump file
+                      || tryAuth(trailerBlk, &kDpB, false);   // Key B from dump file
 
-        DBGF("[WRITE] sector %02d trailer auth -> %s\n", sec, trlAuthed ? "OK" : "FAIL");
+        DBGF("[WRITE] sector %02d trailer auth (A+B) -> %s\n", sec, trlAuthed ? "OK" : "FAIL");
 
         if (trlAuthed) {
           uint8_t trlBuf[16];
           memcpy(trlBuf,      keysDestA[sec], 6);
-          memcpy(trlBuf + 6,  buf + trailerBlk * BYTES_PER_BLOCK + 6, 4);  // AC bits verbatim from dump
+          memcpy(trlBuf + 6,  buf + trailerBlk * BYTES_PER_BLOCK + 6, 4);
           memcpy(trlBuf + 10, keysDestB[sec], 6);
+          // Dump data blocks typically have AC=010 (read-only, Key B) while
+          // the trailer block often requires Key B to write.  Unlock ALL four
+          // blocks (0-3) to AC=000 (read/write with Key A|B) so the data
+          // pass below works and future overwrites can use the simpler Key-A
+          // auth path on Gen2 cards.
+          {
+            uint8_t ab[3] = { trlBuf[6], trlBuf[7], trlBuf[8] };
+            for (int b = 0; b < 4; b++) mfSetAC(ab, b, 0b000);
+            trlBuf[6] = ab[0]; trlBuf[7] = ab[1]; trlBuf[8] = ab[2];
+          }
           MFRC522::StatusCode ts = rfid.MIFARE_Write(trailerBlk, trlBuf, BYTES_PER_BLOCK);
-          DBGF("[WRITE]   trailer blk %02d -> %s\n", trailerBlk,
+          DBGF("[WRITE]   trailer blk %02d (Key-A auth) -> %s\n", trailerBlk,
                ts == MFRC522::STATUS_OK ? "OK" : "FAIL");
-          if (ts != MFRC522::STATUS_OK) sectorOk = false;
+          if (ts == MFRC522::STATUS_OK) {
+            trlWritten = true;
+          } else {
+            // Key A lacked write permission — retry with Key B
+            rfid.PCD_StopCrypto1();
+            bool keyBAuth = tryAuth(trailerBlk, &kDefB, false)
+                         || tryAuth(trailerBlk, &kOB,   false)
+                         || tryAuth(trailerBlk, &kDB,   false)
+                         || tryAuth(trailerBlk, &kDpB,  false);
+            if (keyBAuth) {
+              ts = rfid.MIFARE_Write(trailerBlk, trlBuf, BYTES_PER_BLOCK);
+              DBGF("[WRITE]   trailer blk %02d (Key-B auth) -> %s\n", trailerBlk,
+                   ts == MFRC522::STATUS_OK ? "OK" : "FAIL");
+              if (ts == MFRC522::STATUS_OK) trlWritten = true;
+            }
+          }
           rfid.PCD_StopCrypto1();
-        } else {
-          sectorOk = false;
         }
+        if (!trlWritten) sectorOk = false;
 
-        // ── Pass 2: write data blocks (Bambu AC: requires Key B) ─────────────
-        // After the trailer write the card uses NEW keys → try new Key B first.
-        // Fall back through original card Key B, factory, dump Key B, then Key A
-        // variants for cards whose AC bits allow Key A data-block writes.
-        bool datAuthed = tryAuth(trailerBlk, &kDB,   false)  // Key B new dump UID (just written)
+        // ── Pass 2: write data blocks ────────────────────────────────────────
+        // After the trailer write the card should have NEW keys → try new
+        // Key B first.  But on re-used Gen2 cards the trailer write silently
+        // fails and the OLD keys remain.  We detect this: if kDB fails but
+        // kOB works, the card is in "legacy keys" mode and we skip the UID
+        // change (block 0 write) for sector 0 to avoid UID/keys mismatch.
+        bool usingDestKeys = false;  // true = new dump keys committed
+        bool datAuthed = tryAuth(trailerBlk, &kDB,   false)  // Key B new dump UID
                       || tryAuth(trailerBlk, &kOB,   false)  // Key B original card UID
                       || tryAuth(trailerBlk, &kDefB, false)  // Key B 0xFF×6
                       || tryAuth(trailerBlk, &kDpB,  false)  // Key B from dump file
@@ -1268,28 +1443,55 @@ int rfidWriteDump(const uint8_t* buf, bool /*isMagicCard — now auto-detected v
                       || tryAuth(trailerBlk, &kOA,   true)   // Key A original card UID
                       || tryAuth(trailerBlk, &kDA,   true);  // Key A new dump UID
 
+        // Detect whether the trailer commit actually changed keys.
+        // If kDB works the trailer was committed (fresh Gen2 or normal MIFARE).
+        // If only kOB works the Gen2 card rejected the trailer write — we skip
+        // the UID change to avoid leaving the card with mismatched UID/keys.
+        if (sec == 0 && !isGen2 && datAuthed) {
+          rfid.PCD_StopCrypto1();
+          usingDestKeys = tryAuth(trailerBlk, &kDB, false);
+
+          if (usingDestKeys) {
+            MFRC522::StatusCode ws = rfid.MIFARE_Write(0, (uint8_t*)(buf), BYTES_PER_BLOCK);
+            rfid.PCD_StopCrypto1();
+            if (ws == MFRC522::STATUS_OK) {
+              DBGLN("[WRITE] Gen2 detected — UID changed after successful trailer");
+              isGen2 = true;
+              bambuDeriveKeys(buf, keysDestA, keysDestB);
+              if (!rfidReSelect()) {
+                DBGLN("[WRITE] Gen2 re-select: card lost, aborting");
+                break;
+              }
+              reAssemble = true;
+            }
+          } else {
+            DBGLN("[WRITE] Gen2 card rejects trailer write — keeping original UID");
+          }
+
+          // Re-auth: after Gen2 re-select the card has new UID; after legacy
+          // skip we're still authed with kOB.  Either way, auth state is lost
+          // after the stop/re-select above.
+          MFRC522::MIFARE_Key *keyOrder[] = { &kDB, &kOB, &kDefB, &kDpB,
+                                               &kDef, &kOA, &kDA };
+          datAuthed = false;
+          for (int ki = 0; ki < 7; ki++) {
+            bool isKeyA = (ki >= 4);
+            if (tryAuth(trailerBlk, keyOrder[ki], isKeyA)) {
+              datAuthed = true; break;
+            }
+          }
+        }
+
         DBGF("[WRITE] sector %02d data auth -> %s\n", sec, datAuthed ? "OK" : "FAIL");
 
         if (datAuthed) {
           for (int b = 0; b < 3; b++) {
             int addr = sec * BLOCKS_PER_SECTOR + b;
             if (addr == 0) {
-              if (isGen3) {
-                DBGLN("[WRITE]   blk 00 -> already written via Gen3 APDU, skipping");
+              if (isGen2) {
+                DBGLN("[WRITE]   blk 00 -> already written via Gen2, skipping");
               } else {
-                // Attempt block-0 write: succeeds on Gen2, silent fail on standard MIFARE
-                MFRC522::StatusCode ws = rfid.MIFARE_Write(0, (uint8_t*)(buf), BYTES_PER_BLOCK);
-                if (ws == MFRC522::STATUS_OK) {
-                  if (!isGen2) {
-                    DBGLN("[WRITE] Gen2 magic card detected — block 0 (UID) written");
-                    isGen2 = true;
-                    // Card UID is now the dump UID — re-derive all keys from dump UID
-                    bambuDeriveKeys(buf, keysDestA, keysDestB);
-                  }
-                  DBGLN("[WRITE]   blk 00 -> OK");
-                } else {
-                  DBGLN("[WRITE]   blk 00 -> read-only (standard MIFARE, skipping)");
-                }
+                DBGLN("[WRITE]   blk 00 -> read-only (standard MIFARE, skipping)");
               }
               continue;
             }
@@ -1308,18 +1510,12 @@ int rfidWriteDump(const uint8_t* buf, bool /*isMagicCard — now auto-detected v
         if (g_writeSectorCb) g_writeSectorCb(sec + 1, NUM_SECTORS);
 
         // ── Gen2 post-sector-0 re-select ─────────────────────────────────────
-        // Writing block 0 changes the card's UID. The MFRC522 crypto engine
-        // binds its challenge-response to the UID it discovered during anti-
-        // collision. Without re-selecting the reader keeps using the OLD UID
-        // for sectors 1-15 auth challenges — which the card (now answering as
-        // the NEW UID) will reject every time.
-        // Fix: halt → wait → re-poll so the reader discovers the new UID.
-        if (sec == 0 && isGen2) {
+        if (sec == 0 && isGen2 && reAssemble) {
           if (!rfidReSelect()) {
             DBGLN("[WRITE] Gen2 re-select after block 0 failed — aborting");
             break;
           }
-          DBGLN("[WRITE] Gen2 re-select OK — reader now sees new UID, continuing sectors 1-15");
+          DBGLN("[WRITE] Gen2 re-select OK — reader now sees new UID");
         }
       }
     }
@@ -1662,13 +1858,54 @@ void drawFatBrowser() {
 String wifiSSID, wifiPass, ghToken;
 bool apMode = false;
 
+// Save WiFi credentials to FFat as JSON (mirrors NVS storage)
+static void wifiSaveJson(const String& ssid, const String& pass) {
+  if (!FFat.exists("/") || !FFat.begin(false)) {
+    DBGLN("[WiFi]  FFat not available — skipping JSON save");
+    return;
+  }
+  DynamicJsonDocument doc(128);
+  doc["ssid"] = ssid;
+  doc["pass"] = pass;
+  File f = FFat.open("/wifi.json", FILE_WRITE);
+  if (f) {
+    serializeJson(doc, f);
+    f.close();
+    DBGLN("[WiFi]  Saved /wifi.json");
+  }
+}
+
+// Load WiFi credentials from FFat JSON (fallback when NVS is empty)
+static bool wifiLoadJson(String& ssid, String& pass) {
+  if (!FFat.exists("/wifi.json")) return false;
+  File f = FFat.open("/wifi.json", FILE_READ);
+  if (!f) return false;
+  DynamicJsonDocument doc(128);
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) return false;
+  ssid = doc["ssid"] | "";
+  pass = doc["pass"] | "";
+  return !ssid.isEmpty();
+}
+
 void wifiLoadCreds() {
-  DBGLN("[WiFi]  Loading credentials from FFat...");
+  DBGLN("[WiFi]  Loading credentials from NVS...");
   prefs.begin("wifi", true);
   wifiSSID = prefs.getString("ssid", "");
   wifiPass = prefs.getString("pass", "");
   ghToken = prefs.getString("ghtoken", "");
   prefs.end();
+
+  // Fall back to FFat JSON if NVS is empty
+  if (wifiSSID.isEmpty()) {
+    String jsonSSID, jsonPass;
+    if (wifiLoadJson(jsonSSID, jsonPass)) {
+      DBGF("[WiFi]  Loaded from /wifi.json: %s\n", jsonSSID.c_str());
+      wifiSSID = jsonSSID;
+      wifiPass = jsonPass;
+    }
+  }
 }
 
 void wifiSaveCreds(const String& ssid, const String& pass) {
@@ -1679,6 +1916,7 @@ void wifiSaveCreds(const String& ssid, const String& pass) {
   prefs.end();
   wifiSSID = ssid;
   wifiPass = pass;
+  wifiSaveJson(ssid, pass);  // also persist to FFat
 }
 
 // ── GitHub token helpers ───────────────────────────────────────────────
@@ -5574,8 +5812,8 @@ void processGen4Manage() {
         httpServer.handleClient();
         encUpdate();
         int d = encGetDelta();
-        if (d > 0) { g2sel = (g2sel + 1) % 3; drawGen2ActionMenu(g2sel, g2hdr); t0 = millis(); }
-        if (d < 0) { g2sel = (g2sel - 1 + 3) % 3; drawGen2ActionMenu(g2sel, g2hdr); t0 = millis(); }
+        if (d > 0) { g2sel = (g2sel + 1) % 4; drawGen2ActionMenu(g2sel, g2hdr); t0 = millis(); }
+        if (d < 0) { g2sel = (g2sel - 1 + 4) % 4; drawGen2ActionMenu(g2sel, g2hdr); t0 = millis(); }
         if (encGetClick()) { g2confirmed = true; break; }
         delay(10);
       }
@@ -5592,6 +5830,13 @@ void processGen4Manage() {
         memcpy(uid4, rfid.uid.uidByte, 4);
 
         if (g2sel == 1) {
+          showStatus("Gen2 Tool\n\nRepairing tag...");
+          bool ok = gen2RepairTag(uid4);
+          DBGF("[GEN2] repair: %s\n", ok ? "OK" : "FAIL");
+          rfid.PCD_StopCrypto1(); rfid.PICC_HaltA();
+          if (ok) { ledFlash(0, 255, 0, 2); showStatus("Gen2 Tool\nTag Repaired!\nTrailer unlocked\n\nClick to return."); }
+          else    { ledFlash(255, 0, 0, 2); showStatus("Gen2 Tool\nRepair FAILED\nCard may be\nbricked\n\nClick to return."); }
+        } else if (g2sel == 2) {
           showStatus("Gen2 Tool\n\nLocking Block 0...");
           bool ok = gen2LockBlock0(uid4);
           DBGF("[GEN2] lock: %s\n", ok ? "OK" : "FAIL");
