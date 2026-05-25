@@ -1,5 +1,7 @@
 # <img alt="logo" src="Logo/bambutagger.png" height="36" /> BambuTagger
 
+# Development stopped. The new BambuTagger uses a Touchscreen and can be found [here](https://github.com/VID-PRO/BambuTagger-Touch)
+
 An ESP32-based tool for reading, cloning, and writing Bambu Lab filament spool RFID tags.  
 Designed around the MIFARE Classic 1K tags embedded in Bambu Lab spools, with full HKDF-SHA256 key derivation, a rotary-encoder OLED menu, a WS2812B status LED, and a built-in web interface.
 
